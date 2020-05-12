@@ -16,6 +16,8 @@ Four conditions (2x2):
 - two stimulus levels (40 and 80 dB SPL)
 - either both the target and background noise were diotic (N~0~S~0~), or the target signal was inverted in polarity in one ear (N~0~S~$\pi$~) leading to a phase disparity across the ears
 
+### Hypotheses
+
 ```{r setup, echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
 library(brms)
 library(tidyverse)
@@ -23,7 +25,6 @@ library(tidybayes)
 library(bayesplot)
 library(GGally)
 library(here)
-#source(here("analysis/goHHL.R"))
 ```
 
 ### The data
@@ -96,10 +97,11 @@ sigma ~ cauchy(0,1) <br />
 Question: 
 
 * Why would you use a half-cauchy distribution as opposed to an exponential or half-normal? I've heard that the cauchy distribution assumes medium-large effects, not small ones.
+* Should I add a `1 +` for my intercept in the model?
 
 ```{r, eval = FALSE}
 # specify varying intercept only model
-brms_fmla <- brmsformula(uLevs ~ (1 | listener))
+brms_fmla <- brmsformula(uLevs ~ 1 + (1 | listener))
 
 # specify priors
 priors <- c(
@@ -146,6 +148,20 @@ ppc_dens_overlay(y = as.vector(d$uLevs),
 ```
 
 This looks reasonable. It's not perfect, but it's a prior, it doesn't need to be. The data can do the rest. At least this is in the right ballpark, suggesting I didn't do something obviously stupid (yet). 
+
+
+From https://www.rensvandeschoot.com/tutorials/brms-started/:
+We see that the intercept (mean) is -4.98 and that the credible interval ranges from -7.80 to -2.13. In the brms output, not the variance of the first and second level is given, but instead the standard deviation. So, if we want to calculate the Intraclass correlation (ICC) we need to do this ourselves. We can use of the following code to calculate the ICC. This function will also indicate if 0 is included in the 95% CCI of the ICC. 
+
+https://www.theanalysisfactor.com/the-intraclass-correlation-coefficient-in-mixed-models/
+
+```{r}
+hyp <- "sd_listener__Intercept^2 / (sd_listener__Intercept^2 + sigma^2) = 0"
+hypothesis(prior_only.mod, hyp, class = NULL)
+```
+
+It just includes 0, so a multilevel model may not be warranted? But it probably won't hurt.
+
 
 #### Step 2: Start adding predictor variables
 
@@ -234,6 +250,18 @@ save(full.mod, file = here("fullModel.RDATA"))
 load(here("fullModel.RDATA"))
 summary(full.mod)
 ```
+
+```{r}
+#to get the Stan code:
+  Model_Stan_Code <- stancode(full.mod)
+  writeLines(Model_Stan_Code, "fullModel.stan")
+  
+#  and you'll definitely want:
+stanD <- standata(full.mod)
+```
+
+Looking at the stan data, the intercept is always 1, why? And where does this come from in the code? And then after that all predictors are centered? Interesting.
+
 
 Questions:
 
@@ -348,9 +376,163 @@ mcmc_trace(post, regex_pars = "b_")
 
 This looks good, nothing crazy going on.
 
+### Data visualisation brms tutorial
+https://www.rensvandeschoot.com/tutorials/brms-started/
+
+```{r}
+library(ggmcmc)
+full.mod.t <- ggs(full.mod) # the ggs function transforms the brms output into a longformat tibble, that we can use to make different types of plots.
+
+# make sure to specify this correctly: fixed[4,3:4]
+ggplot(filter(full.mod.t, Parameter == "b_group", Iteration > 1000), aes(x = value))+
+  geom_density(fill = "orange", alpha = .5)+
+  geom_vline(xintercept = 0, col = "red", size = 1)+ 
+  geom_vline(xintercept = summary(full.mod)$fixed[4,3:4], col = "blue", linetype = 2)+
+  theme_light()+
+  labs(title = "Posterior Density of Regression Coefficient for Group")
+```
+
+Question: what do the CI values refer to? Are they 95% credible intervals? Not confidence intervals, right?
+
+### Add a random slope
+
+Based on the pairs plot, where it looked like there was a correlation between the intercept and the slopes of manipulation, dBSPL, and group. I'm going to add a random slope for dBSPL to start with. Nesting participants within group might be a good idea too at some point. 
+
+It might make more sense to choose different random slopes, this is just so I can figure out how this works.
+
+
+```{r}
+d <- iee %>% 
+  mutate(listener = as.numeric(listener)) %>%  
+  mutate(manipulation = as.numeric(fct_rev(as.factor(manipulation))),
+         dBSPL = as.numeric(dBSPL),
+         group = as.numeric(group))
+```
+
+
+I don't know why this 1+ stuff is necessary, or not, but I'm going to put it in for now. I can change this when I figure out what it does. I mean, it changes the sd and sigma, but why?
+
+LKJ: prior for the correlation matrix (between intercepts and slopes). Value of 2 (or anything above 1, really) means that extreme correlations are less likely. 
+
+```{r, eval = FALSE}
+# specify varying intercept & manipulation effect model
+brms_fmla <- brmsformula(uLevs ~ 1 + manipulation + dBSPL + group + (1 + dBSPL | listener))
+
+# specify priors
+priors <- c(
+  set_prior("normal(-5,1.5)",  class = "Intercept"),
+  set_prior("normal(-3,1)",  class = "b", coef = "manipulation"),
+  set_prior("normal(-3,1)",  class = "b", coef = "dBSPL"),
+  set_prior("normal(1,1)",  class = "b", coef = "group"),
+  set_prior("cauchy(0,1)",  class = "sd"),
+  set_prior("cauchy(0,1)",  class = "sd", coef = "Intercept", group = "listener"),
+  set_prior("lkj(2)", class = "cor")
+)
+
+# compile and run model
+randomslope.mod <- brm(
+  brms_fmla,
+  data = d,
+  family = "gaussian",
+  prior = priors,
+  inits = 0,
+  iter = 5000,
+  warmup = 2000,
+  chains = 4,
+  cores = 4,
+  sample_prior = TRUE,
+  seed = 42,
+  control = list(max_treedepth = 10,
+                 adapt_delta = 0.8)
+)
+
+save(randomslope.mod, file = here("RandomSlopeModel.RDATA"))
+```
+
+```{r, echo = FALSE}
+load(here("RandomSlopeModel.RDATA"))
+summary(randomslope.mod, WAIC = TRUE)
+```
+
+Not sure how to decide whether to include the random slope or not. The 95% CI does not include 0, so I guess keep it? Even if we could toss it out, if it's close to 0, it wouldn't do anything anyway, so it would be fine. 
+
+### Go all out model!
+
+```{r}
+d <- iee %>% 
+  mutate(listener = as.numeric(listener)) %>%  
+  mutate(manipulation = as.numeric(fct_rev(as.factor(manipulation))),
+         dBSPL = as.numeric(dBSPL),
+         group = as.numeric(group))
+```
+
+
+```{r, eval = FALSE}
+# specify varying intercept & manipulation effect model
+brms_fmla <- brmsformula(uLevs ~ 1 + manipulation + dBSPL + group + 
+                           manipulation:group +
+                           dBSPL:group +
+                           manipulation:dBSPL:group +
+                           (1 + dBSPL | listener))
+
+# specify priors
+priors <- c(
+  set_prior("normal(-5,1.5)",  class = "Intercept"),
+  set_prior("normal(-3,1)",  class = "b", coef = "manipulation"),
+  set_prior("normal(-3,1)",  class = "b", coef = "dBSPL"),
+  set_prior("normal(1,1)",  class = "b", coef = "group"),
+  set_prior("cauchy(0,1)",  class = "sd"),
+  set_prior("cauchy(0,1)",  class = "sd", coef = "Intercept", group = "listener"),
+  set_prior("lkj(2)", class = "cor")
+)
+
+# compile and run model
+AllOut.mod <- brm(
+  brms_fmla,
+  data = d,
+  family = "gaussian",
+  prior = priors,
+  inits = 0,
+  iter = 5000,
+  warmup = 2000,
+  chains = 4,
+  cores = 4,
+  sample_prior = TRUE,
+  seed = 42,
+  control = list(max_treedepth = 10,
+                 adapt_delta = 0.8)
+)
+
+save(AllOut.mod, file = here("AllOutModel.RDATA"))
+```
+
+```{r, echo = FALSE}
+load(here("AllOutModel.RDATA"))
+summary(AllOut.mod)
+```
+
+Plot stuff 
+
+
+https://cran.r-project.org/web/packages/brms/vignettes/brms_overview.pdf
+
+
+```{r}
+hypothesis(fit1, "Intercept - age > 0", class = "sd", group = "patient")
+
+# In accordance with this finding,theEvid.Ratioshows that the hypothesis being tested (i.e.,Intercept - age > 0) is about68 times more likely than the alternative hypothesisIntercept - age < 0.  It is importantto note that this kind of comparison is not easily possible when applying frequentist methods,because in this case only point estimates are available for group-level standard deviations andcorrelations.
+```
+
+Should I include a random slope of dBSPL?
+```{r}
+fit2 <- update(AllOut.mod, formula. = ~ . - (1 + dBSPL|listener) + (1|listener))
+LOO(AllOut.mod, fit2)
+```
+
+
+
 ### More questions
 
-* Anything else I should be doing? Or something I shouldn't be doing?
 * How would I best explain the difference in inference between Bayesian and frequentist stats?
 * What if you have unequal number of measures per participant, partly on purpose, because you decided to rerun a test occasionally? I think that's fine, the multilevel model will deal with that. My collaborator wants to compute a median across multiple measurements.
 * Are there fewer assumptions because you can just model things the way you want?
